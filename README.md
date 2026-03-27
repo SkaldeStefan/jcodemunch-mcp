@@ -273,6 +273,8 @@ AI provider keys (`ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `OPENAI_API_BASE`, `MIN
 
 AI provider priority in auto-detect mode: Anthropic → Gemini → OpenAI-compatible (`OPENAI_API_BASE`) → MiniMax → GLM-5 → signature fallback. Set `JCODEMUNCH_SUMMARIZER_PROVIDER` to force `anthropic`, `gemini`, `openai`, `minimax`, `glm`, or `none`. `jcodemunch-mcp config` shows which provider is active.
 
+`allow_remote_summarizer` only affects OpenAI-compatible HTTP endpoints. When `false`, jcodemunch accepts only localhost-style endpoints such as Ollama or LM Studio on `127.0.0.1` and rejects remote hosts like `api.minimax.io`. When a remote endpoint is rejected, AI summarization falls back to docstrings or signatures instead of sending source code to that provider. Set `allow_remote_summarizer: true` in `config.jsonc` if you intentionally want to use a hosted OpenAI-compatible provider such as MiniMax or GLM-5.
+
 ---
 
 ## When does it help?

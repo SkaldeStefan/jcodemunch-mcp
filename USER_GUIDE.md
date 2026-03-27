@@ -189,6 +189,15 @@ With optional GitHub auth and AI summaries:
   no higher-priority provider is configured or when
   `JCODEMUNCH_SUMMARIZER_PROVIDER=openai`.
 
+* `allow_remote_summarizer`
+  Controls whether OpenAI-compatible endpoints may point to non-localhost
+  hosts. The default is `false`, which means endpoints such as
+  `http://127.0.0.1:11434/v1` work, but remote hosts such as
+  `https://api.minimax.io/v1` are blocked. When blocked, jcodemunch does not
+  send code to that provider and falls back to docstring or signature-based
+  summaries. Set `allow_remote_summarizer: true` in `config.jsonc` when you
+  intentionally want to use a hosted OpenAI-compatible provider.
+
 * `MINIMAX_API_KEY`
   Enables AI-generated summaries via MiniMax using the default model
   `minimax-m2.7`.

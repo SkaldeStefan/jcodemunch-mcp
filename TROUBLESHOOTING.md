@@ -38,7 +38,10 @@ optional package installed.
    `http://127.0.0.1:11434/v1` for Ollama).
 4. For MiniMax summaries: `pip install "jcodemunch-mcp[minimax]"`, set
    `MINIMAX_API_KEY`, and optionally force it with
-   `JCODEMUNCH_SUMMARIZER_PROVIDER=minimax`.
+   `JCODEMUNCH_SUMMARIZER_PROVIDER=minimax`. If MiniMax is reached through the
+   hosted endpoint `https://api.minimax.io/v1`, also set
+   `allow_remote_summarizer: true` in `config.jsonc`; otherwise jcodemunch
+   rejects the non-localhost endpoint and falls back to signature summaries.
 5. For GLM-5 summaries: `pip install "jcodemunch-mcp[zhipu]"`, set
    `ZHIPUAI_API_KEY`, and optionally force it with
    `JCODEMUNCH_SUMMARIZER_PROVIDER=glm`.
