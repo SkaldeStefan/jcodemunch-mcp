@@ -148,6 +148,9 @@ LANGUAGE_EXTENSIONS = {
     # XML / XUL
     ".xml": "xml",
     ".xul": "xml",
+    # YAML / Ansible (Ansible path heuristics handled in get_language_for_path)
+    ".yaml": "yaml",
+    ".yml": "yaml",
     # OpenAPI / Swagger (compound extensions; basenames handled in get_language_for_path)
     ".openapi.yaml": "openapi",
     ".openapi.yml": "openapi",
@@ -1299,6 +1302,34 @@ XML_SPEC = LanguageSpec(
 )
 
 
+YAML_SPEC = LanguageSpec(
+    ts_language="yaml",
+    symbol_node_types={},
+    name_fields={},
+    param_fields={},
+    return_type_fields={},
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=[],
+    constant_patterns=[],
+    type_patterns=[],
+)
+
+
+ANSIBLE_SPEC = LanguageSpec(
+    ts_language="yaml",
+    symbol_node_types={},
+    name_fields={},
+    param_fields={},
+    return_type_fields={},
+    docstring_strategy="preceding_comment",
+    decorator_node_type=None,
+    container_node_types=[],
+    constant_patterns=[],
+    type_patterns=[],
+)
+
+
 # OpenAPI / Swagger specification
 # NOTE: Parsed by _parse_openapi_symbols() in extractor.py using yaml/json.
 # File detection uses compound extensions (.openapi.yaml, .swagger.json, …)
@@ -1366,6 +1397,8 @@ LANGUAGE_REGISTRY = {
     "autohotkey": AHK_SPEC,
     "asm": ASM_SPEC,
     "xml": XML_SPEC,
+    "yaml": YAML_SPEC,
+    "ansible": ANSIBLE_SPEC,
     "openapi": OPENAPI_SPEC,
 }
 
@@ -1379,6 +1412,38 @@ _OPENAPI_BASENAMES = frozenset({
     "openapi.yaml", "openapi.yml", "openapi.json",
     "swagger.yaml", "swagger.yml", "swagger.json",
 })
+
+_ANSIBLE_PLAYBOOK_DIRS = frozenset({"playbooks", "playbook"})
+_ANSIBLE_ROLE_DIR_SEGMENTS = frozenset({"tasks", "handlers", "vars", "defaults", "meta"})
+_ANSIBLE_SPECIAL_DIRS = frozenset({"group_vars", "host_vars"})
+_ANSIBLE_BASENAMES = frozenset({
+    "site.yml", "site.yaml",
+    "requirements.yml", "requirements.yaml",
+    "galaxy.yml", "galaxy.yaml",
+})
+
+
+def _looks_like_ansible_path(path: str) -> bool:
+    """Best-effort path heuristics for Ansible YAML files."""
+    lower = path.lower().replace("\\", "/")
+    base = os.path.basename(lower)
+    parts = [part for part in lower.split("/") if part]
+    if not base.endswith((".yml", ".yaml")):
+        return False
+
+    if base in _ANSIBLE_BASENAMES:
+        return True
+    if any(marker in parts for marker in _ANSIBLE_PLAYBOOK_DIRS):
+        return True
+    if any(marker in parts for marker in _ANSIBLE_SPECIAL_DIRS):
+        return True
+
+    for idx, part in enumerate(parts):
+        if part != "roles" or idx + 2 >= len(parts):
+            continue
+        if parts[idx + 2] in _ANSIBLE_ROLE_DIR_SEGMENTS:
+            return True
+    return False
 
 
 def _apply_extra_extensions() -> None:
@@ -1421,8 +1486,9 @@ def get_language_for_path(path: str) -> "Optional[str]":
 
     Check order:
     1. Well-known OpenAPI/Swagger basenames (openapi.yaml, swagger.json, …).
-    2. Compound suffixes (e.g. ``.blade.php``, ``.openapi.yaml``).
-    3. Last extension (e.g. ``.php``).
+    2. Ansible path heuristics for YAML inventory/playbook files.
+    3. Compound suffixes (e.g. ``.blade.php``, ``.openapi.yaml``).
+    4. Last extension (e.g. ``.php``).
     """
     _apply_extra_extensions()
     import os as _os
@@ -1431,12 +1497,15 @@ def get_language_for_path(path: str) -> "Optional[str]":
     # 1. Basename match for OpenAPI sentinel files
     if base in _OPENAPI_BASENAMES:
         return "openapi"
-    # 2. Compound extension (e.g. ".blade.php", ".openapi.yaml")
+    # 2. Path heuristics for Ansible YAML files
+    if _looks_like_ansible_path(lower):
+        return "ansible"
+    # 3. Compound extension (e.g. ".blade.php", ".openapi.yaml")
     first_dot = base.find(".")
     if first_dot != -1:
         compound = base[first_dot:]
         if compound in LANGUAGE_EXTENSIONS:
             return LANGUAGE_EXTENSIONS[compound]
-    # 3. Simple extension
+    # 4. Simple extension
     _, ext = _os.path.splitext(lower)
     return LANGUAGE_EXTENSIONS.get(ext)

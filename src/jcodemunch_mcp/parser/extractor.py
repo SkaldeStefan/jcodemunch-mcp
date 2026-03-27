@@ -80,6 +80,10 @@ def parse_file(content: str, filename: str, language: str, source_bytes: Optiona
         symbols = _parse_asm_symbols(source_bytes, filename)
     elif language == "xml":
         symbols = _parse_xml_symbols(source_bytes, filename)
+    elif language == "yaml":
+        symbols = _parse_yaml_symbols(source_bytes, filename)
+    elif language == "ansible":
+        symbols = _parse_ansible_symbols(source_bytes, filename)
     elif language == "openapi":
         symbols = _parse_openapi_symbols(source_bytes, filename)
     elif language == "al":
@@ -5656,6 +5660,391 @@ def _parse_xml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
             _walk(child)
 
     _walk(tree.root_node)
+    return symbols
+
+
+def _load_yaml_data(source: str):
+    """Load YAML content, returning None on parser/import failure."""
+    try:
+        import yaml as _yaml
+        docs = [doc for doc in _yaml.safe_load_all(source) if doc is not None]
+        if not docs:
+            return None
+        if len(docs) == 1:
+            return docs[0]
+        return docs
+    except Exception:
+        return None
+
+
+def _build_line_offsets(source: str) -> tuple[list[str], list[int]]:
+    """Return source lines plus cumulative UTF-8 byte offsets."""
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line.encode("utf-8")))
+    return lines, offsets
+
+
+def _find_line(lines: list[str], text: str, after: int = 0) -> int:
+    """Find the first 1-based line containing text after a starting index."""
+    needle = str(text).strip().lower()
+    if not needle:
+        return max(after + 1, 1)
+    for idx in range(max(after, 0), len(lines)):
+        if needle in lines[idx].lower():
+            return idx + 1
+    return max(after + 1, 1)
+
+
+def _byte_start(offsets: list[int], line_1based: int) -> int:
+    """Return the byte offset for a 1-based line number."""
+    idx = line_1based - 1
+    return offsets[idx] if 0 <= idx < len(offsets) else 0
+
+
+def _scalar_signature(name: str, value: object) -> str:
+    """Render a short key/value signature for scalar YAML values."""
+    text = repr(value)
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return f"{name}: {text}"
+
+
+def _append_virtual_symbol(
+    symbols: list[Symbol],
+    filename: str,
+    language: str,
+    name: str,
+    qualified_name: str,
+    kind: str,
+    signature: str,
+    line: int,
+    offsets: list[int],
+    docstring: str = "",
+    parent: Optional[str] = None,
+) -> str:
+    """Append a synthesized symbol backed by signature bytes."""
+    payload = signature.encode("utf-8")
+    symbol_id = make_symbol_id(filename, qualified_name, kind)
+    symbols.append(Symbol(
+        id=symbol_id,
+        file=filename,
+        name=name,
+        qualified_name=qualified_name,
+        kind=kind,
+        language=language,
+        signature=signature,
+        docstring=docstring,
+        parent=parent,
+        line=line,
+        end_line=line,
+        byte_offset=_byte_start(offsets, line),
+        byte_length=len(payload),
+        content_hash=compute_content_hash(payload),
+    ))
+    return symbol_id
+
+
+def _yaml_list_item_segment(item: object, index: int) -> str:
+    """Prefer semantic list item names over raw indices when possible."""
+    if isinstance(item, dict):
+        for key in ("name", "key", "id"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return f"[{index}]"
+
+
+def _walk_yaml_value(
+    value: object,
+    path_parts: list[str],
+    filename: str,
+    language: str,
+    symbols: list[Symbol],
+    lines: list[str],
+    offsets: list[int],
+    after_line: int = 0,
+) -> None:
+    """Recursively extract structural symbols from generic YAML content."""
+    if isinstance(value, dict):
+        cursor = after_line
+        for key, child in value.items():
+            key_name = str(key)
+            qualified_name = ".".join(path_parts + [key_name]) if path_parts else key_name
+            line = _find_line(lines, f"{key_name}:", cursor - 1)
+            next_cursor = line + 1
+            cursor = next_cursor
+            if isinstance(child, (dict, list)):
+                kind = "type"
+                signature = f"{key_name}:"
+                _append_virtual_symbol(
+                    symbols, filename, language, key_name, qualified_name, kind, signature, line, offsets
+                )
+                _walk_yaml_value(
+                    child, path_parts + [key_name], filename, language, symbols, lines, offsets, next_cursor
+                )
+            else:
+                signature = _scalar_signature(key_name, child)
+                _append_virtual_symbol(
+                    symbols,
+                    filename,
+                    language,
+                    key_name,
+                    qualified_name,
+                    "constant",
+                    signature,
+                    line,
+                    offsets,
+                )
+    elif isinstance(value, list):
+        cursor = after_line
+        for index, child in enumerate(value):
+            segment = _yaml_list_item_segment(child, index)
+            item_line = cursor or 1
+            if isinstance(child, dict) and isinstance(child.get("name"), str):
+                item_line = _find_line(lines, str(child["name"]), cursor - 1)
+            elif path_parts:
+                item_line = _find_line(lines, path_parts[-1], cursor - 1)
+            next_cursor = item_line + 1
+            cursor = next_cursor
+            if isinstance(child, (dict, list)):
+                _walk_yaml_value(
+                    child, path_parts + [segment], filename, language, symbols, lines, offsets, next_cursor
+                )
+
+
+def _parse_yaml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
+    """Parse generic YAML and extract structural symbols from keys and containers."""
+    source = source_bytes.decode("utf-8", errors="replace")
+    data = _load_yaml_data(source)
+    if not isinstance(data, (dict, list)):
+        return []
+
+    lines, offsets = _build_line_offsets(source)
+    symbols: list[Symbol] = []
+    if isinstance(data, list) and all(isinstance(item, dict) for item in data):
+        cursor = 0
+        for item in data:
+            _walk_yaml_value(item, [], filename, "yaml", symbols, lines, offsets, cursor)
+            cursor += 1
+        return symbols
+    _walk_yaml_value(data, [], filename, "yaml", symbols, lines, offsets)
+    return symbols
+
+
+def _looks_like_ansible_play(item: object) -> bool:
+    """Heuristic for Ansible playbook entries."""
+    return isinstance(item, dict) and any(
+        key in item for key in ("hosts", "tasks", "handlers", "pre_tasks", "post_tasks", "roles")
+    )
+
+
+def _ansible_task_name(task: dict, index: int) -> str:
+    """Pick a stable display name for an Ansible task."""
+    name = task.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    skip = {
+        "name", "when", "vars", "register", "tags", "loop", "with_items",
+        "delegate_to", "become", "become_user", "notify", "listen",
+        "environment", "args", "retries", "delay", "until", "changed_when",
+        "failed_when", "loop_control", "ignore_errors", "import_tasks",
+        "include_tasks", "block", "rescue", "always",
+    }
+    for key in task:
+        if key not in skip:
+            return str(key)
+    return f"task_{index + 1}"
+
+
+def _ansible_role_name(role: object, index: int) -> str:
+    """Extract a role name from roles entries."""
+    if isinstance(role, str) and role.strip():
+        return role.strip()
+    if isinstance(role, dict):
+        for key in ("role", "name"):
+            value = role.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return f"role_{index + 1}"
+
+
+def _append_ansible_tasks(
+    symbols: list[Symbol],
+    filename: str,
+    offsets: list[int],
+    lines: list[str],
+    section_name: str,
+    tasks: object,
+    scope_name: str,
+    parent_id: Optional[str] = None,
+    start_line: int = 0,
+) -> None:
+    """Append Ansible task-like entries as function symbols."""
+    if not isinstance(tasks, list):
+        return
+    cursor = start_line
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        task_name = _ansible_task_name(task, index)
+        line = _find_line(lines, task_name, cursor - 1)
+        if line == cursor and task_name.startswith("task_"):
+            line = _find_line(lines, "-", cursor - 1)
+        cursor = line
+        qualified_name = f"{scope_name}.{section_name}.{task_name}"
+        signature = f"{section_name} {task_name}"
+        docstring = ""
+        when_clause = task.get("when")
+        if isinstance(when_clause, str) and when_clause.strip():
+            docstring = f"when: {when_clause.strip()}"
+        _append_virtual_symbol(
+            symbols,
+            filename,
+            "ansible",
+            task_name,
+            qualified_name,
+            "function",
+            signature,
+            line,
+            offsets,
+            docstring=docstring,
+            parent=parent_id,
+        )
+
+
+def _append_ansible_vars(
+    symbols: list[Symbol],
+    filename: str,
+    offsets: list[int],
+    lines: list[str],
+    values: object,
+    scope_name: str,
+    after_line: int = 0,
+) -> None:
+    """Append Ansible variable symbols from nested mapping structures."""
+    if isinstance(values, dict):
+        cursor = after_line
+        for key, child in values.items():
+            key_name = str(key)
+            qualified_name = f"{scope_name}.{key_name}" if scope_name else key_name
+            line = _find_line(lines, f"{key_name}:", cursor - 1)
+            next_cursor = line + 1
+            cursor = next_cursor
+            if isinstance(child, dict):
+                _append_virtual_symbol(
+                    symbols, filename, "ansible", key_name, qualified_name, "type", f"{key_name}:", line, offsets
+                )
+                _append_ansible_vars(symbols, filename, offsets, lines, child, qualified_name, next_cursor)
+            elif isinstance(child, list):
+                _append_virtual_symbol(
+                    symbols, filename, "ansible", key_name, qualified_name, "type", f"{key_name}:", line, offsets
+                )
+                list_cursor = next_cursor
+                for idx, item in enumerate(child):
+                    segment = _yaml_list_item_segment(item, idx)
+                    if isinstance(item, dict):
+                        item_line = list_cursor
+                        if isinstance(item.get("name"), str) and item["name"].strip():
+                            item_line = _find_line(lines, item["name"], list_cursor - 1)
+                        item_cursor = item_line + 1
+                        _append_ansible_vars(
+                            symbols, filename, offsets, lines, item, f"{qualified_name}.{segment}", item_cursor
+                        )
+                        list_cursor = item_cursor
+            else:
+                _append_virtual_symbol(
+                    symbols,
+                    filename,
+                    "ansible",
+                    key_name,
+                    qualified_name,
+                    "constant",
+                    _scalar_signature(key_name, child),
+                    line,
+                    offsets,
+                )
+
+
+def _parse_ansible_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
+    """Parse common Ansible YAML structures such as plays, tasks, roles, and vars."""
+    source = source_bytes.decode("utf-8", errors="replace")
+    data = _load_yaml_data(source)
+    if not isinstance(data, (dict, list)):
+        return []
+
+    lower = filename.lower().replace("\\", "/")
+    lines, offsets = _build_line_offsets(source)
+    symbols: list[Symbol] = []
+
+    is_var_file = any(marker in lower for marker in ("/group_vars/", "/host_vars/", "/vars/", "/defaults/"))
+    is_task_file = any(marker in lower for marker in ("/tasks/", "/handlers/"))
+
+    if isinstance(data, list) and any(_looks_like_ansible_play(item) for item in data):
+        cursor = 0
+        for index, play in enumerate(data):
+            if not isinstance(play, dict):
+                continue
+            play_name = play.get("name")
+            if not isinstance(play_name, str) or not play_name.strip():
+                hosts = play.get("hosts")
+                if isinstance(hosts, str) and hosts.strip():
+                    play_name = f"play {hosts.strip()}"
+                else:
+                    play_name = f"play_{index + 1}"
+            play_line = _find_line(lines, str(play_name), cursor - 1)
+            cursor = play_line
+            host_text = play.get("hosts")
+            docstring = f"hosts: {host_text}" if isinstance(host_text, str) and host_text.strip() else ""
+            play_id = _append_virtual_symbol(
+                symbols,
+                filename,
+                "ansible",
+                str(play_name),
+                str(play_name),
+                "class",
+                f"play {play_name}",
+                play_line,
+                offsets,
+                docstring=docstring,
+            )
+            for section in ("pre_tasks", "tasks", "post_tasks", "handlers"):
+                _append_ansible_tasks(
+                    symbols, filename, offsets, lines, section, play.get(section), str(play_name), play_id, play_line
+                )
+            roles = play.get("roles")
+            if isinstance(roles, list):
+                role_cursor = play_line
+                for role_index, role in enumerate(roles):
+                    role_name = _ansible_role_name(role, role_index)
+                    role_line = _find_line(lines, role_name, role_cursor - 1)
+                    role_cursor = role_line
+                    _append_virtual_symbol(
+                        symbols,
+                        filename,
+                        "ansible",
+                        role_name,
+                        f"{play_name}.roles.{role_name}",
+                        "type",
+                        f"role {role_name}",
+                        role_line,
+                        offsets,
+                        parent=play_id,
+                    )
+        return symbols
+
+    if is_task_file and isinstance(data, list):
+        section = "handlers" if "/handlers/" in lower else "tasks"
+        scope_name = section.rstrip("s")
+        _append_ansible_tasks(symbols, filename, offsets, lines, section, data, scope_name, None, 1)
+        return symbols
+
+    if is_var_file and isinstance(data, dict):
+        _append_ansible_vars(symbols, filename, offsets, lines, data, "")
+        return symbols
+
+    _walk_yaml_value(data, [], filename, "ansible", symbols, lines, offsets)
     return symbols
 
 
